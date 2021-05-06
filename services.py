@@ -1,22 +1,19 @@
 import os
 from datetime import datetime, timedelta
-
+from dotenv import load_dotenv
 import jwt
 import json
-import logging
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from typing import Optional
 from dataclasses import dataclass, asdict
 
-HASURA_URL = "https://square-bee-43.hasura.app/v1/graphql"
-HASURA_HEADERS = {"X-Hasura-Admin-Secret": "0shpGp3GJairCwJD7QP4aAsJA5byW6xCcRrY5XFJ3pyV1qTR1zHNbGTSF8RWOYMn"}
-HASURA_JWT_SECRET = os.getenv("HASURA_GRAPHQL_JWT_SECRET",
-                              "django-insecure-61av8^4^#i$_+sf)_w7v)0%*l-ao&d^x5nvz%zw6$-ku$*jeip")
-#{"type": "HS256","key": "django-insecure-61av8^4^#i$_+sf)_w7v)0%*l-ao&d^x5nvz%zw6$-ku$*jeip"}
+load_dotenv(override=True)
 
+HASURA_URL = os.getenv("HASURA_URL")
+HASURA_HEADERS = {"X-Hasura-Admin-Secret": os.getenv("HASURA_HEADERS")}
+HASURA_JWT_SECRET = os.getenv("HASURA_JWT_SECRET")
 
 ################
 # GRAPHQL CLIENT
@@ -47,6 +44,44 @@ class Client:
             }
         """,
         {"email": email},
+    )
+
+    find_user_id = lambda self, id: self.run_query(
+        """
+            query UserById($id: Int!) {
+                my_hasura_user(where: {id: {_eq: $id}}) {
+                    id
+                    email
+                    password
+                }
+            }
+        """,
+        {"id": id},
+    )
+
+    insert_blacklist_tokens = lambda self, token: self.run_query(
+        """
+            mutation InsertBlacklistToken($token: String!) {
+                insert_my_hasura_blacklist_tokens(objects: {token: $token}) {
+                    returning {
+                      token
+                    }
+                }
+            }
+        """,
+        {"token": token},
+    )
+
+    find_blacklist_token = lambda self, token: self.run_query(
+        """
+            query FindBlacklistToken($token: String!) {
+                my_hasura_blacklist_tokens(where: {token: {_eq: $token}}) {
+                      blacklisted_on
+                      token
+                }
+            }
+        """,
+        {"token": token},
     )
 
     create_user = lambda self, email, password: self.run_query(
@@ -116,6 +151,33 @@ def rehash_and_save_password_if_needed(user, plaintext_password):
         client.update_password(user["id"], Password.hash(plaintext_password))
 
 
+def check_blacklist(auth_token):
+    # check whether auth token has been blacklisted
+    res = client.find_blacklist_token(str(auth_token))
+    if len(res['data']['my_hasura_blacklist_tokens']) > 0:
+        return True
+    else:
+        return False
+
+
+def decode_auth_token(auth_token):
+    """
+    Decodes the auth token
+    :param auth_token:
+    :return: integer|string
+    """
+    try:
+        payload = jwt.decode(auth_token, HASURA_JWT_SECRET, "HS256")
+        is_blacklisted_token = check_blacklist(auth_token)
+        if is_blacklisted_token:
+            return 'Token blacklisted. Please log in again.'
+        else:
+            return payload['sub']
+    except jwt.ExpiredSignatureError:
+        return 'Signature expired. Please log in again.'
+    except jwt.InvalidTokenError:
+        return 'Invalid token. Please log in again.'
+
 #############
 # DATA MODELS
 #############
@@ -135,7 +197,7 @@ class RequestMixin:
 
 
 @dataclass
-class CreateUserOutput(RequestMixin):
+class UserOutput(RequestMixin):
     id: int
     email: str
     password: str
@@ -168,7 +230,7 @@ def signup_handler():
         return {"message": user_response["errors"][0]["message"]}, 400
     else:
         user = user_response["data"]["insert_my_hasura_user"]["returning"]
-        return CreateUserOutput(**user[0]).to_json()
+        return UserOutput(**user[0]).to_json()
 
 
 @app.route("/login", methods=["POST"])
@@ -184,6 +246,59 @@ def login_handler():
         return JsonWebToken(generate_token(user)).to_json()
     except VerifyMismatchError:
         return {"message": "Invalid credentials"}, 401
+
+
+@app.route("/get-user", methods=["POST"])
+def get_user_handler():
+    # get the auth token
+    args = JsonWebToken.from_request(request.get_json())
+    auth_token = args.token
+    if auth_token:
+        resp = decode_auth_token(auth_token)
+        if resp.isdigit():
+            user_response = client.find_user_id(int(resp))
+            if len(user_response["data"]["my_hasura_user"]) == 0:
+                return {"message": "User not found."}, 401
+            user = user_response["data"]["my_hasura_user"][0]
+            return UserOutput(**user).to_json()
+        return {
+            'message': resp
+        }, 401
+    else:
+        return {
+            'message': 'Provide a valid auth token.'
+        }, 401
+
+
+@app.route("/logout", methods=["POST"])
+def logout_handler():
+    # get auth token
+    args = JsonWebToken.from_request(request.get_json())
+    auth_token = args.token
+    if auth_token:
+        resp = decode_auth_token(auth_token)
+        if resp.isdigit():
+            # mark the token as blacklisted
+            token_response = client.insert_blacklist_tokens(auth_token)
+            if len(token_response["data"]['insert_my_hasura_blacklist_tokens']['returning']) == 0:
+                return {"message": "Invalid credentials"}
+            return {
+                'message': 'Successfully logged out.'
+            }, 200
+
+        else:
+            return {
+                'message': resp
+            }, 401
+    else:
+        return {
+            'message': 'Provide a valid auth token.'
+        }, 403
+
+
+@app.route("/refresh", methods=["POST"])
+def refresh_token():
+    return {"message": "some token"}, 200
 
 
 if __name__ == "__main__":

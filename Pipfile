@@ -10,6 +10,7 @@ flask = "*"
 argon2-cffi = "*"
 requests = "*"
 pyjwt = "*"
+python-dotenv = "*"
 
 [requires]
 python_version = "3.9"
